@@ -1,0 +1,243 @@
+################################################
+#title           :hyRAD_complete_pipeline
+#description     :This script combine all scripts for the analyses undertaken for the paper entitled : Museomics identifies genetic erosion in two butterfly species across the 20th century in Finland
+#author		 : Jeremy Gauthier
+#email	: jeremy.gauthier@ville-ge.ch
+#date            :10.27.2019
+################################################
+
+
+###########################################################
+################### Probes analyses #######################
+###########################################################
+
+
+#Generate a collapsed fastq file for each sample using adapterremoval
+source activate /home/jeremy/local/envadapterremoval/
+for i in `ls *_1.fastq.gz` ; do name=`echo $i | sed -e 's/_1.fastq.gz//g'` ; AdapterRemoval --file1 "$i" --file2 "$name"_2.fastq.gz --basename "$name" --gzip --collapse ; done
+
+#count the number of occurance of each identical sequence in each sample (from ddocent)
+ls *.collapsed.gz > namelist
+sed -i'' -e 's/.collapsed.gz//g' namelist
+AWK1='BEGIN{P=1}{if(P==1||P==2){gsub(/^[@]/,">");print}; if(P==4)P=0; P++}'
+AWK2='!/>/'
+AWK3='!/NNN/'
+PERLT='while (<>) {chomp; $z{$_}++;} while(($k,$v) = each(%z)) {print "$v\t$k\n";}'
+cat namelist | parallel --no-notice -j 8 "zcat {}.collapsed.gz | mawk '$AWK1' | mawk '$AWK2' > {}.collapsed"
+cat namelist | parallel --no-notice -j 8 "cat {}.collapsed | mawk '$AWK3' | perl -e '$PERLT' > {}.collapsed.uniq.seqs"
+cat namelist | parallel --no-notice -j 8 "zcat {}.pair1.truncated.gz | mawk '$AWK1' | mawk '$AWK2' > {}.forward"
+cat namelist | parallel --no-notice -j 8 "zcat {}.pair2.truncated.gz | mawk '$AWK1' | mawk '$AWK2' > {}.reverse"
+cat namelist | parallel --no-notice -j 8 "paste -d '-' {}.forward {}.reverse | mawk '$AWK3' | sed 's/-/NNNNNNNNNN/' | perl -e '$PERLT' > {}.uniq.seqs"
+cat namelist | parallel --no-notice -j 8 "cat {}.collapsed.uniq.seqs {}.uniq.seqs > {}.alluniq.seqs"
+
+#keep allele with cov more than 4 transformation in fasta
+for i in `ls *.alluniq.seqs` ; do awk '{if ($1 >= 4) print $2}' "$i" | mawk '{c= c + 1; print ">Contig_" c "\n" $1}' > "$i"_sup4.fasta ; done
+
+#merge loci intra indiv
+for i in `ls *_sup4.fasta` ; do name=`echo $i | sed -e 's/\.fasta//g'` ; cd-hit-est -i "$i" -o "$name"_cdhit_clusters_090 -c 0.90 ; done 
+
+#combine loci between samples
+for i in `ls *.alluniq.seqs_sup4_cdhit_clusters_090` ; do name=`echo $i | sed -e 's/.alluniq.seqs_sup4_cdhit_clusters_090//g'` ; sed -e 's/>/>'"$name"'_/g' "$i" > "$i"_n.fasta ; done
+cat *.alluniq.seqs_sup4_cdhit_clusters_090_n.fasta | sed -e 's/_Contig_/_/g' > all.out.fq.alluniq.seqs_sup4_cdhit_clusters_090_n.fasta
+cd-hit-est -i all.out.fq.alluniq.seqs_sup4_cdhit_clusters_090_n.fasta -o all.out.fq.alluniq.seqs_sup4_cdhit_clusters_090_n_cdhit_clusters_090 -c 0.90
+
+Keep loci shared by at least 3 probes
+cat all.out.fq.alluniq.seqs_sup4_cdhit_clusters_090_n_cdhit_clusters_090.clstr | tr '\t' '_' | sed -e 's/ /_/g' | tr '\n' '\t' | sed -e 's/>Cluster/#>Cluster/g' | tr '#' '\n' | grep "." | awk '{print $1"\t"NF-1}' | awk '{if ($2 >= 3) print $1}' > temp_list_locus_shared_sup3
+cat all.out.fq.alluniq.seqs_sup4_cdhit_clusters_090_n_cdhit_clusters_090.clstr  | tr '\t' '_' | sed -e 's/ /_/g' | tr '\n' '\t' | sed -e 's/>Cluster/#>Cluster/g' | tr '#' '\n' | grep "." > temp_inline
+while read a ; do awk '{if ($1 == "'$a'") print $0}' temp_inline | tr '\t' '\n' | grep "\*" | awk -F "_" '{print $3"_"$4}' | sed -e 's/\.//g' -e 's/>//g' >> temp_list_ref_to_keep ; done < temp_list_locus_shared_sup3
+fastaselect.pl all.out.fq.alluniq.seqs_sup4_cdhit_clusters_090_n_cdhit_clusters_090 temp_list_ref_to_keep > all.out.fq.alluniq.seqs_sup4_cdhit_clusters_090_n_cdhit_clusters_090_shared3.fasta
+
+#contamination verification
+centrifuge -x nt -f -U all.out.fq.alluniq.seqs_sup4_cdhit_clusters_090_n_cdhit_clusters_090_shared3.fasta -p 8 --report-file centrifuge.report.tsv -S centrifuge.output
+
+###########################################################
+################## Samples analyses #######################
+###########################################################
+
+#reads cleaning
+AdapterRemoval --file1 $samplename.R1.fastq.gz --file2 $samplename.R2.fastq.gz --samplename $samplename --gzip --barcode-list barcodes_$base.txt;"
+
+#mapping bwa aln
+bwa aln -t 20 all.out.fq.alluniq.seqs_sup4_cdhit_clusters_090_n_cdhit_clusters_090_shared3.fasta $samplename.out.fq_1.fastq.gz > temp_$samplename_aln_R1.sai
+bwa aln -t 20 all.out.fq.alluniq.seqs_sup4_cdhit_clusters_090_n_cdhit_clusters_090_shared3.fasta $samplename.out.fq_2.fastq.gz > temp_$samplename_aln_R2.sai
+bwa sampe all.out.fq.alluniq.seqs_sup4_cdhit_clusters_090_n_cdhit_clusters_090_shared3.fasta temp_$samplename_aln_R1.sai temp_$samplename_aln_R2.sai $samplename.out.fq_1.fastq.gz $samplename.out.fq_2.fastq.gz > $samplename_aln.sam
+
+#mapping bwa mem
+bwa mem -t 20 all.out.fq.alluniq.seqs_sup4_cdhit_clusters_090_n_cdhit_clusters_090_shared3.fasta $samplename.out.fq_1.fastq.gz $samplename.out.fq_2.fastq.gz > $samplename_mem.sam
+
+#mapping bowtie2
+bowtie2 -p 2 -x all.out.fq.alluniq.seqs_sup4_cdhit_clusters_090_n_cdhit_clusters_090_shared3.fasta -1 $samplename.out.fq_1.fastq.gz -2 $samplename.out.fq_2.fastq.gz -S $samplename_bowtie2.sam
+
+#mapping cleaning
+samtools sort "$samplename"_"$tool".sam -o "$samplename"_"$tool"_sort.bam
+samtools view -bF 4 "$samplename"_"$tool"_sort.bam > "$samplename"_"$tool"_sort_keep.bam
+picard MarkDuplicates I="$samplename"_"$tool"_sort_keep.bam O="$samplename"_"$tool"_sort_keep_pcrdup.bam M=marks REMOVE_DUPLICATES=true
+mapDamage -i "$samplename"_"$tool"_sort_keep_pcrdup.bam -r all.out.fq.alluniq.seqs_sup4_cdhit_clusters_090_n_cdhit_clusters_090_shared3.fasta --rescale --merge-reference-sequences
+
+#SNP calling with freebayes
+freebayes -f all.out.fq.alluniq.seqs_sup4_cdhit_clusters_090_n_cdhit_clusters_090_shared3.fasta *.rescaled.bam > "$tool"_allfilters_freebayes.vcf
+
+#SNP calling with varscan
+samtools mpileup -A -B -f all.out.fq.alluniq.seqs_sup4_cdhit_clusters_090_n_cdhit_clusters_090_shared3.fasta *.rescaled.bam > temp_allfilters.pileup
+varscan mpileup2snp temp_allfilters.pileup --output-vcf 1 > "$tool"_allfilters_varscan.vcf
+
+#filters
+vcftools --vcf "$tool"_allfilters_freebayes.vcf --max-missing 0.80 --minQ 100 --remove-indels --min-alleles 2 --max-alleles 2 --recode --out "$tool"_allfilters_freebayes_miss080_minQ100_bi
+vcftools --vcf "$tool"_allfilters_varscan.vcf --max-missing 0.80 --remove-indels --min-alleles 2 --max-alleles 2 --recode --out "$tool"_allfilters_freebayes_miss080_bi
+
+###########################################################
+############ Population genetics analyses #################
+###########################################################
+
+#statistics estimations (R script)
+library("ggplot2")
+library("adegenet")
+library("Rmisc")
+library("hierfstat")
+data <- read.table("output.genind", header = TRUE)
+
+min_sample=8
+
+locus <- data[, c(3:ncol(data))]
+colnames(locus) <- gsub(".", "_", colnames(locus))
+ind <- as.character(data$sample)
+population <- as.character(data$pop)
+data1 <- df2genind(locus, ploidy = 2, ind.names = ind, pop = population, sep = "",NA.char="NA")
+data2 <- genind2hierfstat(data1)
+basicstat <- basic.stats(data2, diploid = TRUE, digits = 2)
+
+#Hs
+Hs<-basicstat$Hs
+Hs2<-as.data.frame(as.table(Hs))
+tgc <- summarySE(Hs2, measurevar="Freq", groupvars="Var2",na.rm=TRUE)
+merge_tgc<-merge(tgc,pop,by.x=c("Var2"), by.y=c("population"))
+
+tgc_2<-data.frame(t(data.frame(strsplit(as.character(merge_tgc$Var2),'_'))),merge_tgc$N,merge_tgc$Freq.x,merge_tgc$sd,merge_tgc$se,merge_tgc$ci,merge_tgc$Freq.y)
+tgc_3<-tgc_2[tgc_2$merge_tgc.Freq.y > min_sample,]
+
+ggplot(tgc_3, aes(x=as.Date(X2, format="%Y"), y=merge_tgc.Freq.x, colour=X1)) + 
+  geom_errorbar(aes(ymin=merge_tgc.Freq.x-merge_tgc.se, ymax=merge_tgc.Freq.x+merge_tgc.se), width=0.1) +
+  geom_line() +
+  geom_point() +
+  geom_text(aes(label=merge_tgc.Freq.y),hjust=0.5, vjust=-1) +
+  geom_text(aes(label=merge_tgc.N),hjust=0.5, vjust=2) +
+  xlab("Year") +
+  ylab("Observed gene diversities (Hs)") +
+  theme_bw()
+
+#FIS
+FIS<-basicstat$Fis
+FIS_2<-as.data.frame(as.table(FIS))
+tgc <- summarySE(FIS_2, measurevar="Freq", groupvars="Var2",na.rm=TRUE)
+merge_tgc<-merge(tgc,pop,by.x=c("Var2"), by.y=c("population"))
+tgc_2<-data.frame(t(data.frame(strsplit(as.character(merge_tgc$Var2),'_'))),merge_tgc$N,merge_tgc$Freq.x,merge_tgc$sd,merge_tgc$se,merge_tgc$ci,merge_tgc$Freq.y)
+tgc_3<-tgc_2[tgc_2$merge_tgc.Freq.y > min_sample,]
+ggplot(tgc_3, aes(x=as.Date(X2, format="%Y"), y=merge_tgc.Freq.x, colour=X1)) + 
+  geom_errorbar(aes(ymin=merge_tgc.Freq.x-merge_tgc.se, ymax=merge_tgc.Freq.x+merge_tgc.se), width=0.1) +
+  geom_line() +
+  geom_point() +
+  geom_text(aes(label=merge_tgc.Freq.y),hjust=0.5, vjust=-1) +
+  geom_text(aes(label=merge_tgc.N),hjust=0.5, vjust=2) +
+  xlab("Year") +
+  ylab("Inbreeding coefficient (FIS)") +
+  theme_bw()
+
+#extinction allele
+Freq<-data.frame(basicstat$pop.freq)
+nb_zero <- function(x) {sum(x == 0)}
+nb_value <- function(x) {sum(x != "NA")}
+tab_zero<-aggregate(Freq[,3] ~ Freq[,2], data = Freq, nb_zero)
+tab_all<-aggregate(Freq[,3] ~ Freq[,2], data = Freq, nb_value)
+combined<-merge(tab_all,tab_zero,by.x=c("Freq[, 2]"), by.y=c("Freq[, 2]"))
+names(combined)[1] <- "pop"
+names(combined)[2] <- "all"
+names(combined)[3] <- "zero"
+combined$freq<-data.frame(combined$zero/combined$all)
+combined2<-merge(combined,pop,by.x=c("pop"), by.y=c("population"))
+Freq_sum_x<-data.frame(t(data.frame(strsplit(as.character(combined2$pop),'_'))),combined2$freq,combined2$all,combined2$Freq)
+Freq_sum_3<-Freq_sum_x[Freq_sum_x$combined2.Freq > min_sample,]
+ggplot(Freq_sum_3, aes(x=as.Date(X2, format="%Y"), y=combined.zero.combined.all, colour=X1)) + 
+  geom_line() +
+  geom_point() +
+  xlab("Year") +
+  ylab("Frequence of extinct allele") +
+  geom_text(aes(label=combined2.all),hjust=0.5, vjust=2) +
+  geom_text(aes(label=combined2.Freq),hjust=0.5, vjust=-1) +
+  theme_bw()
+
+#FST
+FST<-pairwise.WCfst(data2,diploid=TRUE)
+library("reshape2")
+FST_pair<-melt(FST)
+
+#IBD (R script)
+gps <- read.table("pop_GPS.txt", header = TRUE)
+output<-data.frame()
+for (row in 1:nrow(gps)) {
+  anpop <- gps[row,1]
+  nlat <- gps[row,2]
+  nlong <- gps[row,3]
+  for (row in 1:nrow(gps)) {
+    anpop2 <- gps[row,1]
+    nlat2 <- gps[row,2]
+    nlong2 <- gps[row,3]
+    dist<-geodist(nlat, nlong , nlat2, nlong2,units="km")
+    gb<-data.frame(anpop,anpop2,dist)
+    output=rbind(output, gb)
+  }
+}
+
+FST<- read.table("fst.txt", header = FALSE)
+GPS<-read.table("distance.txt", header = FALSE)
+
+merge_fst_gps<-merge(FST,GPS,by.x=c("V2"), by.y=c("V1"))
+merge_fst_gps_2<-data.frame(merge_fst_gps[,1],merge_fst_gps[,2],merge_fst_gps[,3]/(1-merge_fst_gps[,3]),log(merge_fst_gps[,4]))
+
+d1925<-merge_fst_gps_2[merge_fst_gps_2[,2] == "1925",]
+d1975<-merge_fst_gps_2[merge_fst_gps_2[,2] == "1975",]
+d2015<-merge_fst_gps_2[merge_fst_gps_2[,2] == "2015",]
+
+par(mfrow=c(2,3),mai=c(0.8, 0.8, 0.1, 0),omi=c(0.2,0.1,0.1,0.1))
+plot(d1925[,4],d1925[,3],pch=19,xlab="log(Distance (km))",ylab="FST/1-FST",xlim=c(3.5,7),ylim=c(-0.03,0.1))
+cor.test(d1925[,4],d1925[,3],method="spearman")
+model<- lm(d1925[,3] ~ d1925[,4], data = d1925)
+summary(model)
+abline(lm(model),xlim=c(3.5,7),ylim=c(-0.03,0.1))
+model$coefficients
+
+plot(d1975[,4],d1975[,3],pch=19,xlab="log(Distance (km))",ylab="FST/1-FST",xlim=c(3.5,7),ylim=c(-0.03,0.1))
+cor.test(d1975[,4],d1975[,3],method="spearman")
+model<- lm(d1975[,3] ~ d1975[,4], data = d1975)
+summary(model)
+abline(lm(model),xlim=c(3.5,7),ylim=c(-0.03,0.1))
+model$coefficients
+
+plot(d2015[,4],d2015[,3],pch=19,xlab="log(Distance (km))",ylab="FST/1-FST",xlim=c(3.5,7),ylim=c(-0.03,0.1))
+cor.test(d2015[,4],d2015[,3],method="spearman")
+model<- lm(d2015[,3] ~ d2015[,4], data = d2015)
+summary(model)
+abline(lm(model),xlim=c(3.5,7),ylim=c(-0.03,0.1))
+model$coefficients
+
+
+#STRUCTURE
+random_select_snp_by_loci.sh "$tool"_allfilters_freebayes_miss080_minQ100_bi.recode.vcf 1SNP_"$tool"_allfilters_freebayes_miss080_minQ100_bi.recode.vcf
+vcf2structure.sh 1SNP_"$tool"_allfilters_freebayes_miss080_minQ100_bi.recode.vcf
+
+#number of replicate
+for i in `seq 1 10`
+	do
+#K tested
+	for j in `seq 1 5`
+		do
+		mkdir st"$i"_"$j"_"$1".dir
+		nb_sample=$(echo $((`grep -c "." $1`/2)))
+		nb_marker=`awk '{print NF}' $1 | sort | uniq -c | awk '{print $2}'`
+		sed -e 's/KN/'"$j"'/g' -e 's/name_output/st'"$i"'_'"$j"'_results/g' -e 's/name_sample/'"$1"'/g' -e 's/nb_sample/'"$nb_sample"'/g' -e 's/nb_marker/'"$nb_marker"'/g' mainparams > ./st"$i"_"$j"_"$1".dir/mainparams
+		cp extraparams ./st"$i"_"$j"_"$1".dir/
+		cp structure ./st"$i"_"$j"_"$1".dir/
+		cp run.sh ./st"$i"_"$j"_"$1".dir/st"$i"_"$j".sh
+		./st"$i"_"$j"_"$1".dir/st"$i"_"$j".sh
+		done
+	done
+
